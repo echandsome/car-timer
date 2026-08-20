@@ -2,8 +2,34 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
+
+class GpsSample {
+  final int elapsedRealtimeNanos;
+  final DateTime sampleTime;
+  final double speedKmh;
+  final double? speedAccuracyMps;
+  final double? latitude;
+  final double? longitude;
+  final double accuracyMeters;
+  final double distanceDeltaMeters;
+  final bool hasSpeed;
+  final String provider;
+
+  const GpsSample({
+    required this.elapsedRealtimeNanos,
+    required this.sampleTime,
+    required this.speedKmh,
+    required this.speedAccuracyMps,
+    required this.latitude,
+    required this.longitude,
+    required this.accuracyMeters,
+    required this.distanceDeltaMeters,
+    required this.hasSpeed,
+    required this.provider,
+  });
+}
 
 class LocationService extends ChangeNotifier {
   static final LocationService _instance = LocationService._internal();
@@ -14,9 +40,13 @@ class LocationService extends ChangeNotifier {
 
   Position? _currentPosition;
 
-  // Confirmed speed is the trusted GPS/native speed used for test logic/results.
+  // Confirmed speed is the trusted GPS/native speed used for UI gating.
   double _currentSpeed = 0.0; // km/h
   double _confirmedSpeedKmh = 0.0; // km/h
+
+  // Timing speed is the unsmoothed Doppler sample used for 0/100 interpolation.
+  // It is allowed to be below the "moving" threshold so rollout can be detected.
+  double _timingSpeedKmh = 0.0;
 
   // Display speed is UI-only smoothing for hub/needle responsiveness.
   // Never use this for result saving or target completion.
@@ -47,9 +77,8 @@ class LocationService extends ChangeNotifier {
 
   DateTime? _lastGpsUpdate;
 
-  // Real sample timestamp from Android/Fused GPS when available.
-  // Used for better target-crossing interpolation in PerformanceService.
   DateTime? _lastGpsSampleTime;
+  int? _lastElapsedRealtimeNanos;
   double _lastGpsSpeedKmh = 0.0;
   double _lastPlatformSpeedKmh = 0.0;
   double _rawNativeSpeedKmh = 0.0;
@@ -61,30 +90,40 @@ class LocationService extends ChangeNotifier {
   int _lastGpsIntervalMs = 0;
   int _lastGpsSampleAgeMs = 0;
   int _gpsReadySamples = 0;
-  int _movingSamples = 0;
   double _maxTrustedSpeedKmh = 0.0;
+  int _satelliteCount = 0;
+  int _usedSatelliteCount = 0;
+  String _provider = 'none';
+  GpsSample? _lastTimingSample;
 
-  static const double strongGpsAccuracyMeters = 35.0;
-  static const double testGpsAccuracyMeters = 20.0;
+  static const double strongGpsAccuracyMeters = 50.0;
+  static const double testGpsAccuracyMeters = 25.0;
 
-  // 0.8 km/h se neeche phone GPS noise bohat hota hai.
+  // UI "vehicle is moving" gate. Timing uses a lower interpolated start trigger.
   static const double minTrustedPlatformSpeedKmh = 0.8;
 
   static const int freshGpsSeconds = 4;
+  static const double maxCredibleAccelerationMps2 = 25.0;
+  static const double maxSpeedAccuracyMps = 4.0;
 
   int get gpsUpdateCount => _gpsUpdateCount;
   int get lastGpsIntervalMs => _lastGpsIntervalMs;
   int get lastGpsSampleAgeMs => _lastGpsSampleAgeMs;
   DateTime? get lastPositionReceivedAt => _lastPositionReceivedAt;
+  int? get lastElapsedRealtimeNanos => _lastElapsedRealtimeNanos;
+  GpsSample? get lastTimingSample => _lastTimingSample;
+  int get satelliteCount => _satelliteCount;
+  int get usedSatelliteCount => _usedSatelliteCount;
+  String get provider => _provider;
 
   Position? get currentPosition => _currentPosition;
 
-  // Existing getter remains confirmed speed so old test logic does not accidentally use smoothed UI speed.
   double get currentSpeed => _currentSpeed;
 
   double get confirmedSpeedKmh => _confirmedSpeedKmh;
   double get displaySpeedKmh => _displaySpeedKmh;
   double get rawNativeSpeedKmh => _rawNativeSpeedKmh;
+  double get timingSpeedKmh => _timingSpeedKmh;
 
   double get totalDistance => _totalDistance;
   List<Position> get positionHistory => List.unmodifiable(_positionHistory);
@@ -96,7 +135,11 @@ class LocationService extends ChangeNotifier {
   bool get isUsingMotionFallback => false;
 
   String get speedSource => _speedSource;
-  bool get isUsingGps => _speedSource == 'GPS' || _speedSource == 'Native GPS';
+  bool get isUsingGps =>
+      _speedSource == 'GPS' ||
+      _speedSource == 'Native GPS' ||
+      _speedSource == 'GNSS' ||
+      _speedSource == 'NMEA';
   double get lastGpsAccuracy => _lastGpsAccuracy;
   double get lastGpsSpeedKmh => _lastGpsSpeedKmh;
   double get lastPlatformSpeedKmh => _lastPlatformSpeedKmh;
@@ -123,14 +166,11 @@ class LocationService extends ChangeNotifier {
     if (!_isTracking) return false;
     if (!hasFreshGpsUpdate) return false;
     if (_lastGpsAccuracy > testGpsAccuracyMeters) return false;
-
-    // 1 sample enough rakha hai taake user ko 10–20 sec wait na karna paray.
     return _gpsReadySamples >= 1;
   }
 
   bool get hasTrustedSpeed {
-    return (_speedSource == 'GPS' || _speedSource == 'Native GPS') &&
-        _lastGpsSpeedKmh >= minTrustedPlatformSpeedKmh;
+    return isUsingGps && _lastGpsSpeedKmh >= minTrustedPlatformSpeedKmh;
   }
 
   String get gpsSignalMessage {
@@ -230,7 +270,6 @@ class LocationService extends ChangeNotifier {
     double nextDisplaySpeed;
 
     if (target <= 0.05) {
-      // Fast decay prevents the UI from feeling stuck at old speed after stop.
       nextDisplaySpeed = _displaySpeedKmh * 0.35;
 
       if (nextDisplaySpeed < 0.25) {
@@ -238,8 +277,6 @@ class LocationService extends ChangeNotifier {
       }
     } else {
       final double delta = target - _displaySpeedKmh;
-
-      // Faster response when accelerating, stronger decay when slowing.
       final double factor = delta >= 0 ? 0.45 : 0.65;
       nextDisplaySpeed = _displaySpeedKmh + (delta * factor);
 
@@ -273,10 +310,27 @@ class LocationService extends ChangeNotifier {
   }
 
   void _startGeolocatorFallbackTracking() {
-    const locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 0,
-    );
+    final LocationSettings locationSettings;
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      locationSettings = AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+        intervalDuration: const Duration(milliseconds: 50),
+        forceLocationManager: true,
+      );
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      locationSettings = AppleSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+        activityType: ActivityType.automotiveNavigation,
+        pauseLocationUpdatesAutomatically: false,
+      );
+    } else {
+      locationSettings = const LocationSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+      );
+    }
 
     _positionStream?.cancel();
     _positionStream =
@@ -301,7 +355,8 @@ class LocationService extends ChangeNotifier {
 
     final latitude = (event['latitude'] as num?)?.toDouble();
     final longitude = (event['longitude'] as num?)?.toDouble();
-    final accuracy = (event['accuracy'] as num?)?.toDouble() ?? 9999.0;
+    final accuracy =
+        (event['accuracy'] as num?)?.toDouble() ?? _lastGpsAccuracy;
 
     final hasSpeed = event['hasSpeed'] == true;
     final speedMps = (event['speedMps'] as num?)?.toDouble() ?? 0.0;
@@ -310,8 +365,19 @@ class LocationService extends ChangeNotifier {
     final speedAccuracyMps = (event['speedAccuracyMps'] as num?)?.toDouble();
 
     final timeMillis = (event['timeMillis'] as num?)?.toInt();
+    final elapsedRealtimeNanos = (event['elapsedRealtimeNanos'] as num?)
+        ?.toInt();
+    final nmeaSpeedOnly = event['nmeaSpeedOnly'] == true;
+    final provider = (event['provider'] as String?) ?? 'native';
 
-    if (latitude == null || longitude == null) return;
+    _satelliteCount =
+        (event['satelliteCount'] as num?)?.toInt() ?? _satelliteCount;
+    _usedSatelliteCount =
+        (event['usedSatelliteCount'] as num?)?.toInt() ?? _usedSatelliteCount;
+    _provider = provider;
+
+    if (!nmeaSpeedOnly && (latitude == null || longitude == null)) return;
+    if (nmeaSpeedOnly && !hasSpeed) return;
 
     final intervalMs = _lastNativeUpdate == null
         ? 0
@@ -319,11 +385,14 @@ class LocationService extends ChangeNotifier {
 
     _lastNativeUpdate = now;
     _nativeGpsUpdateCount++;
+    _gpsUpdateCount = _nativeGpsUpdateCount;
 
     _lastGpsUpdate = now;
     _lastPositionReceivedAt = now;
     _lastGpsIntervalMs = intervalMs;
-    _lastGpsAccuracy = accuracy;
+    if (!nmeaSpeedOnly) {
+      _lastGpsAccuracy = accuracy;
+    }
 
     if (timeMillis != null && timeMillis > 0) {
       _lastGpsSampleTime = DateTime.fromMillisecondsSinceEpoch(timeMillis);
@@ -333,18 +402,30 @@ class LocationService extends ChangeNotifier {
       _lastGpsSampleAgeMs = 0;
     }
 
-    final bool gpsPositionOk = _lastGpsAccuracy <= testGpsAccuracyMeters;
+    if (elapsedRealtimeNanos != null && elapsedRealtimeNanos > 0) {
+      _lastElapsedRealtimeNanos = elapsedRealtimeNanos;
+    }
 
-    if (gpsPositionOk) {
-      _gpsReadySamples++;
-      if (_gpsReadySamples > 5) _gpsReadySamples = 5;
-    } else {
-      _gpsReadySamples = 0;
+    final bool gpsPositionOk =
+        nmeaSpeedOnly || _lastGpsAccuracy <= testGpsAccuracyMeters;
+
+    if (!nmeaSpeedOnly) {
+      if (gpsPositionOk) {
+        _gpsReadySamples++;
+        if (_gpsReadySamples > 5) _gpsReadySamples = 5;
+      } else if (_gpsReadySamples > 0) {
+        // Do not dump a lock on one slightly worse fix.
+        _gpsReadySamples = math.max(1, _gpsReadySamples - 1);
+      }
     }
 
     double positionMoveDistance = 0.0;
 
-    if (_lastNativeLatitude != null && _lastNativeLongitude != null) {
+    if (!nmeaSpeedOnly &&
+        latitude != null &&
+        longitude != null &&
+        _lastNativeLatitude != null &&
+        _lastNativeLongitude != null) {
       positionMoveDistance = Geolocator.distanceBetween(
         _lastNativeLatitude!,
         _lastNativeLongitude!,
@@ -353,70 +434,74 @@ class LocationService extends ChangeNotifier {
       );
     }
 
-    _lastNativeLatitude = latitude;
-    _lastNativeLongitude = longitude;
+    if (!nmeaSpeedOnly && latitude != null && longitude != null) {
+      _lastNativeLatitude = latitude;
+      _lastNativeLongitude = longitude;
+    }
 
     final bool speedAccuracyOk =
         !hasSpeedAccuracy ||
         speedAccuracyMps == null ||
-        speedAccuracyMps <= 2.5;
+        speedAccuracyMps <= maxSpeedAccuracyMps;
 
     final bool speedSampleUsable = hasSpeed && speedAccuracyOk;
-
     final platformSpeedKmh = speedSampleUsable
         ? math.max(0.0, speedMps * 3.6)
         : 0.0;
 
-    final bool trustedSpeedSampleOk = gpsPositionOk && speedSampleUsable;
-
-    _rawNativeSpeedKmh = platformSpeedKmh;
+    _rawNativeSpeedKmh = math.max(0.0, speedMps * 3.6);
     _lastPlatformSpeedKmh = platformSpeedKmh;
-    _lastGpsMoveDistance = positionMoveDistance;
 
-    if (!gpsPositionOk) {
-      _setConfirmedSpeed(0.0);
-      _movingSamples = 0;
-      _speedSource = 'GPS Weak';
-    } else if (!trustedSpeedSampleOk ||
-        platformSpeedKmh < minTrustedPlatformSpeedKmh) {
-      _setConfirmedSpeed(0.0);
-      _movingSamples = 0;
-      _speedSource = 'Native GPS';
-    } else {
-      _movingSamples++;
+    final acceptedSpeed = speedSampleUsable
+        ? _filterPlatformSpeed(platformSpeedKmh, elapsedRealtimeNanos)
+        : _timingSpeedKmh;
 
-      final acceptedSpeed = _filterPlatformSpeed(platformSpeedKmh);
+    _applyTimingSample(
+      speedKmh: speedSampleUsable ? acceptedSpeed : _timingSpeedKmh,
+      usable: speedSampleUsable,
+      latitude: latitude,
+      longitude: longitude,
+      accuracyMeters: _lastGpsAccuracy,
+      speedAccuracyMps: speedAccuracyMps,
+      hasSpeed: hasSpeed,
+      provider: provider,
+      sampleTime: _lastGpsSampleTime ?? now,
+      elapsedRealtimeNanos: elapsedRealtimeNanos,
+      positionMoveDistance: positionMoveDistance,
+    );
 
-      _setConfirmedSpeed(acceptedSpeed);
-      _speedSource = 'Native GPS';
-
-      if (acceptedSpeed > _maxTrustedSpeedKmh) {
-        _maxTrustedSpeedKmh = acceptedSpeed;
-      }
-    }
-
-    if (trustedSpeedSampleOk &&
-        _confirmedSpeedKmh >= minTrustedPlatformSpeedKmh &&
-        positionMoveDistance >= 0 &&
-        positionMoveDistance < 80) {
-      _totalDistance += positionMoveDistance;
-    }
+    _speedSource = _sourceLabelForProvider(provider, gpsPositionOk);
 
     debugPrint(
       'Native GPS update #$_nativeGpsUpdateCount | '
+      'provider: $provider | '
       'interval: ${intervalMs}ms | '
       'age: ${_lastGpsSampleAgeMs}ms | '
       'hasSpeed: $hasSpeed | '
       'speedAcc: ${speedAccuracyMps?.toStringAsFixed(2) ?? 'n/a'} m/s | '
       'platform: ${platformSpeedKmh.toStringAsFixed(1)} km/h | '
+      'timing: ${_timingSpeedKmh.toStringAsFixed(1)} km/h | '
       'confirmed: ${_confirmedSpeedKmh.toStringAsFixed(1)} km/h | '
-      'display: ${_displaySpeedKmh.toStringAsFixed(1)} km/h | '
       'accuracy: ${_lastGpsAccuracy.toStringAsFixed(0)}m | '
-      'moved: ${positionMoveDistance.toStringAsFixed(1)}m | '
+      'sats: $_usedSatelliteCount/$_satelliteCount | '
       'source: $_speedSource',
     );
 
     notifyListeners();
+  }
+
+  String _sourceLabelForProvider(String provider, bool gpsPositionOk) {
+    if (!gpsPositionOk) return 'GPS Weak';
+    switch (provider) {
+      case 'gnss':
+        return 'GNSS';
+      case 'nmea':
+        return 'NMEA';
+      case 'fused':
+        return 'Native GPS';
+      default:
+        return 'Native GPS';
+    }
   }
 
   void stopTracking() {
@@ -433,35 +518,27 @@ class LocationService extends ChangeNotifier {
 
     _isTracking = false;
     _setConfirmedSpeed(0.0);
+    _timingSpeedKmh = 0.0;
     _displaySpeedKmh = 0.0;
     _displayTargetSpeedKmh = 0.0;
     _speedSource = 'Idle';
     _gpsReadySamples = 0;
-    _movingSamples = 0;
 
     debugPrint('GPS-only location tracking stopped');
     notifyListeners();
   }
 
   void resetForNewRun() {
-    _positionHistory.clear();
-    _lastPositionForMovement = null;
-    _lastGpsSampleTime = null;
-    _lastNativeLatitude = null;
-    _lastNativeLongitude = null;
+    prepareForNewRun();
+  }
 
+  /// Keep the GPS lock and last Doppler sample. Only reset distance so the
+  /// start trigger can interpolate from the last stationary sample.
+  void prepareForNewRun() {
     _totalDistance = 0.0;
     _lastGpsMoveDistance = 0.0;
-    _lastGpsSpeedKmh = 0.0;
-    _lastGpsIntervalMs = 0;
-    _lastGpsSampleAgeMs = 0;
-    _lastPlatformSpeedKmh = 0.0;
-    _rawNativeSpeedKmh = 0.0;
-    _setConfirmedSpeed(0.0);
     _maxTrustedSpeedKmh = 0.0;
-    _movingSamples = 0;
-
-    // GPS readiness clear nahi karni. Warna START ke baad fake waiting state ban jati hai.
+    _positionHistory.clear();
     notifyListeners();
   }
 
@@ -469,7 +546,10 @@ class LocationService extends ChangeNotifier {
     _currentPosition = null;
     _lastPositionForMovement = null;
     _lastGpsSampleTime = null;
+    _lastElapsedRealtimeNanos = null;
+    _lastTimingSample = null;
     _setConfirmedSpeed(0.0);
+    _timingSpeedKmh = 0.0;
     _displaySpeedKmh = 0.0;
     _displayTargetSpeedKmh = 0.0;
 
@@ -482,7 +562,6 @@ class LocationService extends ChangeNotifier {
     _lastGpsMoveDistance = 0.0;
     _maxTrustedSpeedKmh = 0.0;
     _gpsReadySamples = 0;
-    _movingSamples = 0;
     _speedSource = 'Idle';
     _lastPositionReceivedAt = null;
     _lastNativeUpdate = null;
@@ -492,6 +571,9 @@ class LocationService extends ChangeNotifier {
     _lastGpsSampleAgeMs = 0;
     _lastNativeLatitude = null;
     _lastNativeLongitude = null;
+    _satelliteCount = 0;
+    _usedSatelliteCount = 0;
+    _provider = 'none';
 
     if (clearGpsSignal) {
       _lastGpsUpdate = null;
@@ -538,12 +620,12 @@ class LocationService extends ChangeNotifier {
 
     _lastPositionReceivedAt = now;
     _gpsUpdateCount++;
+    _provider = 'geolocator';
 
     final gpsTimestamp = newPosition.timestamp;
-    _lastGpsSampleAgeMs = gpsTimestamp == null
-        ? 0
-        : now.difference(gpsTimestamp).inMilliseconds;
-    _lastGpsSampleTime = gpsTimestamp ?? now;
+    _lastGpsSampleAgeMs = now.difference(gpsTimestamp).inMilliseconds;
+    _lastGpsSampleTime = gpsTimestamp;
+    _lastElapsedRealtimeNanos = gpsTimestamp.microsecondsSinceEpoch * 1000;
 
     _lastGpsUpdate = now;
     _lastGpsAccuracy = newPosition.accuracy;
@@ -552,8 +634,8 @@ class LocationService extends ChangeNotifier {
     if (gpsSampleOk) {
       _gpsReadySamples++;
       if (_gpsReadySamples > 5) _gpsReadySamples = 5;
-    } else {
-      _gpsReadySamples = 0;
+    } else if (_gpsReadySamples > 0) {
+      _gpsReadySamples = math.max(1, _gpsReadySamples - 1);
     }
 
     double positionMoveDistance = 0.0;
@@ -569,42 +651,31 @@ class LocationService extends ChangeNotifier {
     final platformSpeedKmh = math.max(0.0, newPosition.speed * 3.6);
 
     _lastPlatformSpeedKmh = platformSpeedKmh;
+    _rawNativeSpeedKmh = platformSpeedKmh;
     _lastGpsMoveDistance = positionMoveDistance;
 
-    if (!gpsSampleOk) {
-      _setConfirmedSpeed(0.0);
-      _movingSamples = 0;
-      _speedSource = 'GPS Weak';
-    } else if (platformSpeedKmh < minTrustedPlatformSpeedKmh) {
-      _setConfirmedSpeed(0.0);
-      _movingSamples = 0;
-      _speedSource = 'GPS';
-    } else {
-      _movingSamples++;
+    final acceptedSpeed = _filterPlatformSpeed(
+      platformSpeedKmh,
+      _lastElapsedRealtimeNanos,
+    );
 
-      final acceptedSpeed = _filterPlatformSpeed(platformSpeedKmh);
+    _applyTimingSample(
+      speedKmh: acceptedSpeed,
+      usable: true,
+      latitude: newPosition.latitude,
+      longitude: newPosition.longitude,
+      accuracyMeters: newPosition.accuracy,
+      speedAccuracyMps: null,
+      hasSpeed: true,
+      provider: 'geolocator',
+      sampleTime: gpsTimestamp,
+      elapsedRealtimeNanos: _lastElapsedRealtimeNanos,
+      positionMoveDistance: positionMoveDistance,
+    );
 
-      _setConfirmedSpeed(acceptedSpeed);
-      _speedSource = 'GPS';
-
-      if (acceptedSpeed > _maxTrustedSpeedKmh) {
-        _maxTrustedSpeedKmh = acceptedSpeed;
-      }
-    }
-
-    // Distance only counts while GPS platform speed confirms real movement.
-    // This prevents stationary GPS drift from increasing distance after the user stops.
-    if (gpsSampleOk &&
-        _confirmedSpeedKmh >= minTrustedPlatformSpeedKmh &&
-        positionMoveDistance >= 0 &&
-        positionMoveDistance < 80 &&
-        _currentPosition != null &&
-        _lastPositionForMovement != null) {
-      _totalDistance += positionMoveDistance;
-    }
+    _speedSource = gpsSampleOk ? 'GPS' : 'GPS Weak';
 
     _positionHistory.add(newPosition);
-
     if (_positionHistory.length > 100) {
       _positionHistory.removeAt(0);
     }
@@ -614,34 +685,124 @@ class LocationService extends ChangeNotifier {
       'interval: ${_lastGpsIntervalMs}ms | '
       'age: ${_lastGpsSampleAgeMs}ms | '
       'platform: ${platformSpeedKmh.toStringAsFixed(1)} km/h | '
+      'timing: ${_timingSpeedKmh.toStringAsFixed(1)} km/h | '
       'confirmed: ${_confirmedSpeedKmh.toStringAsFixed(1)} km/h | '
-      'display: ${_displaySpeedKmh.toStringAsFixed(1)} km/h | '
       'accuracy: ${_lastGpsAccuracy.toStringAsFixed(0)}m | '
-      'moved: ${positionMoveDistance.toStringAsFixed(1)}m | '
       'source: $_speedSource',
     );
 
     notifyListeners();
   }
 
-  void _setConfirmedSpeed(double speedKmh) {
+  void _applyTimingSample({
+    required double speedKmh,
+    required bool usable,
+    required double? latitude,
+    required double? longitude,
+    required double accuracyMeters,
+    required double? speedAccuracyMps,
+    required bool hasSpeed,
+    required String provider,
+    required DateTime sampleTime,
+    required int? elapsedRealtimeNanos,
+    required double positionMoveDistance,
+  }) {
+    if (!usable) {
+      return;
+    }
+
     final safeSpeed = math.max(0.0, speedKmh);
+    final sampleNanos =
+        elapsedRealtimeNanos ??
+        _lastElapsedRealtimeNanos ??
+        (sampleTime.microsecondsSinceEpoch * 1000);
 
-    _confirmedSpeedKmh = safeSpeed;
-    _currentSpeed = safeSpeed;
-    _lastGpsSpeedKmh = safeSpeed;
+    double distanceDelta = 0.0;
+    final previous = _lastTimingSample;
+    if (previous != null) {
+      final dtSeconds =
+          (sampleNanos - previous.elapsedRealtimeNanos) / 1000000000.0;
+      if (dtSeconds > 0 && dtSeconds < 2.0) {
+        final prevMps = previous.speedKmh / 3.6;
+        final currMps = safeSpeed / 3.6;
+        distanceDelta = ((prevMps + currMps) / 2.0) * dtSeconds;
+      }
+    }
 
-    // UI-only target. Display timer will animate toward this.
-    _displayTargetSpeedKmh = safeSpeed;
+    if (distanceDelta <= 0 &&
+        positionMoveDistance > 0 &&
+        positionMoveDistance < 80) {
+      distanceDelta = positionMoveDistance;
+    }
+
+    if (distanceDelta < 0 || distanceDelta > 80) {
+      distanceDelta = 0.0;
+    }
+
+    _lastGpsMoveDistance = distanceDelta;
+    _timingSpeedKmh = safeSpeed;
+    _lastElapsedRealtimeNanos = sampleNanos;
+    _setConfirmedSpeed(safeSpeed);
+
+    if (distanceDelta > 0) {
+      _totalDistance += distanceDelta;
+    }
+    if (safeSpeed > _maxTrustedSpeedKmh) {
+      _maxTrustedSpeedKmh = safeSpeed;
+    }
+
+    _lastTimingSample = GpsSample(
+      elapsedRealtimeNanos: sampleNanos,
+      sampleTime: sampleTime,
+      speedKmh: safeSpeed,
+      speedAccuracyMps: speedAccuracyMps,
+      latitude: latitude,
+      longitude: longitude,
+      accuracyMeters: accuracyMeters,
+      distanceDeltaMeters: distanceDelta,
+      hasSpeed: hasSpeed,
+      provider: provider,
+    );
   }
 
-  double _filterPlatformSpeed(double rawSpeed) {
-    if (rawSpeed < minTrustedPlatformSpeedKmh) return 0.0;
+  void _setConfirmedSpeed(double speedKmh) {
+    final safeSpeed = math.max(0.0, speedKmh);
+    final uiSpeed = safeSpeed < minTrustedPlatformSpeedKmh ? 0.0 : safeSpeed;
 
-    // No fake fallback. Sirf platform speed.
-    // Tiny unrealistic single spike ko avoid karne ke liye basic sanity cap.
-    if (_confirmedSpeedKmh == 0.0 && rawSpeed > 35.0 && _movingSamples <= 1) {
-      return 0.0;
+    _confirmedSpeedKmh = uiSpeed;
+    _currentSpeed = uiSpeed;
+    _lastGpsSpeedKmh = uiSpeed;
+    _displayTargetSpeedKmh = uiSpeed;
+  }
+
+  double _filterPlatformSpeed(double rawSpeed, int? sampleNanos) {
+    if (rawSpeed < 0) return 0.0;
+
+    final previous = _lastTimingSample;
+    if (previous == null || sampleNanos == null) {
+      return rawSpeed;
+    }
+
+    // Do not treat the first moving sample as a spike. Fast cars can already
+    // be well above 35 km/h by the time the first GNSS tick arrives.
+    if (previous.speedKmh < 1.0) {
+      return rawSpeed > 160.0 ? previous.speedKmh : rawSpeed;
+    }
+
+    final dtSeconds =
+        (sampleNanos - previous.elapsedRealtimeNanos) / 1000000000.0;
+    if (dtSeconds <= 0 || dtSeconds > 2.0) {
+      return rawSpeed;
+    }
+
+    final maxDeltaKmh = maxCredibleAccelerationMps2 * dtSeconds * 3.6;
+    final delta = rawSpeed - previous.speedKmh;
+    if (delta > maxDeltaKmh && maxDeltaKmh > 0) {
+      debugPrint(
+        'Rejected GPS speed spike ${rawSpeed.toStringAsFixed(1)} km/h '
+        '(+${delta.toStringAsFixed(1)} in ${dtSeconds.toStringAsFixed(3)}s)',
+      );
+      return previous.speedKmh;
     }
 
     return rawSpeed;

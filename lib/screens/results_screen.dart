@@ -41,6 +41,8 @@ class _ResultsScreenState extends State<ResultsScreen> {
         return 'Stopped Early';
       case PerformanceStatus.running:
         return 'Running';
+      case PerformanceStatus.armed:
+        return 'Armed';
       case PerformanceStatus.idle:
         return 'Idle';
     }
@@ -54,6 +56,8 @@ class _ResultsScreenState extends State<ResultsScreen> {
         return Colors.orangeAccent;
       case PerformanceStatus.running:
         return Colors.blueAccent;
+      case PerformanceStatus.armed:
+        return Colors.lightBlueAccent;
       case PerformanceStatus.idle:
         return Colors.white54;
     }

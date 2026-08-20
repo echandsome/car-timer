@@ -441,10 +441,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     if (!_isHomeScreenVisible) return;
     if (!_isTimerTabActive && !_isTimerRunning) return;
 
-    // Confirmed speed is used for test logic/results.
-    // Display speed is UI-only smoothing for hub/needle responsiveness.
+    // Confirmed speed is used for UI gating. Timing speed is unsmoothed Doppler.
     final confirmedSpeed = _locationService.confirmedSpeedKmh;
     final displaySpeed = _locationService.displaySpeedKmh;
+    final timingSpeed = _locationService.timingSpeedKmh;
 
     final serviceTotalDistance = _locationService.totalDistance;
     final now = DateTime.now();
@@ -503,19 +503,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     if (_isTimerRunning) {
       _handleGpsWeakDialog();
 
-      final gpsAccuracy = _locationService.lastGpsAccuracy;
-      final bool gpsAccuracyBad =
-          gpsAccuracy > LocationService.strongGpsAccuracyMeters;
-
-      // Do not cancel for normal zero speed. Cancel only for genuinely unreliable GPS.
-      if (gpsAccuracyBad || !_locationService.hasFreshGpsUpdate) {
-        _abortTimerDueToGpsIssue(_locationService.gpsSignalMessage);
-        return;
-      }
-
       if (_isBrakingPreset) {
         _handleBrakingRunningUpdate(
-          confirmedSpeed: confirmedSpeed,
+          timingSpeed: timingSpeed,
           displaySpeed: displaySpeed,
           distanceDelta: distanceDelta,
         );
@@ -556,9 +546,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       }
 
       _performanceService.updatePerformance(
-        currentSpeed: confirmedSpeed,
+        currentSpeed: timingSpeed,
         distanceDelta: distanceDelta,
         sampleTime: _locationService.lastGpsSampleTime,
+        elapsedRealtimeNanos: _locationService.lastElapsedRealtimeNanos,
       );
 
       if (_performanceService.isTargetReached()) {
@@ -781,10 +772,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       return;
     }
 
-    final bool actualGpsProblem =
-        !_locationService.hasFreshGpsUpdate ||
-        _locationService.lastGpsAccuracy >
-            LocationService.strongGpsAccuracyMeters;
+    final bool actualGpsProblem = !_locationService.hasFreshGpsUpdate;
 
     if (actualGpsProblem) {
       _gpsWeakSince ??= now;
@@ -915,7 +903,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   }
 
   void _handleBrakingRunningUpdate({
-    required double confirmedSpeed,
+    required double timingSpeed,
     required double displaySpeed,
     required double distanceDelta,
   }) {
@@ -939,23 +927,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     });
 
     _performanceService.updatePerformance(
-      currentSpeed: confirmedSpeed,
+      currentSpeed: timingSpeed,
       distanceDelta: distanceDelta,
       sampleTime: _locationService.lastGpsSampleTime,
+      elapsedRealtimeNanos: _locationService.lastElapsedRealtimeNanos,
     );
+
+    if (_performanceService.isTargetReached()) {
+      _finishCompletedRun(showSavedDialog: true);
+      return;
+    }
 
     final justStarted = now.difference(_brakingStartedAt!).inMilliseconds < 700;
 
-    // Auto-stop braking when confirmed speed is near zero.
-    // Short delay avoids stopping on a single noisy zero sample.
-    if (!justStarted && confirmedSpeed <= 1.0) {
+    // Fallback if interpolation never sees a clean 0.5 km/h crossing.
+    if (!justStarted && timingSpeed <= TimingMath.brakingStopSpeedKmh) {
       _brakingAutoStopTimer ??= Timer(const Duration(milliseconds: 500), () {
         if (!mounted || !_isTimerRunning || !_isBrakingPreset) {
           _brakingAutoStopTimer = null;
           return;
         }
 
-        if (_locationService.confirmedSpeedKmh <= 1.0) {
+        if (_locationService.timingSpeedKmh <= TimingMath.brakingStopSpeedKmh) {
           _stopTimer(
             saveAsCompleted: true,
             notRecordedReason: 'Vehicle did not come to a confirmed stop.',
@@ -1147,8 +1140,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     final double displaySpeedBeforeReset = _locationService.displaySpeedKmh;
     final double brakingStartBeforeReset = _brakingStartSpeed;
     final DateTime runStartMoment = DateTime.now();
+    final GpsSample? seedSample = _locationService.lastTimingSample;
 
-    _locationService.resetForNewRun();
+    _locationService.prepareForNewRun();
 
     // Braking start speed must be captured exactly when user presses START.
     // Do not allow next GPS sample to redefine the braking start speed.
@@ -1195,6 +1189,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
         presetName: _selectedSpeedPreset,
         targetValue: targetSpeed,
         unit: _getSpeedUnit(),
+        initialSpeed: seedSample?.speedKmh ?? _locationService.timingSpeedKmh,
+        initialElapsedRealtimeNanos:
+            seedSample?.elapsedRealtimeNanos ??
+            _locationService.lastElapsedRealtimeNanos,
+        initialSampleTime:
+            seedSample?.sampleTime ?? _locationService.lastGpsSampleTime,
+        waitForStartTrigger: true,
       );
     } else if (_activeTab == "DISTANCE") {
       if (_selectedDistancePreset == "Braking") {
@@ -1203,6 +1204,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
           presetName: "Braking",
           targetValue: _brakingStartSpeed,
           unit: _getSpeedUnit(),
+          initialSpeed: confirmedSpeedBeforeReset,
+          initialElapsedRealtimeNanos:
+              seedSample?.elapsedRealtimeNanos ??
+              _locationService.lastElapsedRealtimeNanos,
+          initialSampleTime:
+              seedSample?.sampleTime ?? _locationService.lastGpsSampleTime,
+          waitForStartTrigger: false,
         );
       } else {
         final targetDistance = _getTargetDistanceFromPreset(
@@ -1213,6 +1221,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
           presetName: _selectedDistancePreset,
           targetValue: targetDistance,
           unit: "m",
+          initialSpeed: seedSample?.speedKmh ?? _locationService.timingSpeedKmh,
+          initialElapsedRealtimeNanos:
+              seedSample?.elapsedRealtimeNanos ??
+              _locationService.lastElapsedRealtimeNanos,
+          initialSampleTime:
+              seedSample?.sampleTime ?? _locationService.lastGpsSampleTime,
+          waitForStartTrigger: true,
         );
       }
     }
@@ -1252,9 +1267,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     if (shouldSaveCompleted && _saveThisRun) {
       if (_isBrakingPreset) {
         _performanceService.updatePerformance(
-          currentSpeed: _brakingStartSpeed,
+          currentSpeed: _locationService.timingSpeedKmh,
           distanceDelta: 0.0,
           sampleTime: _locationService.lastGpsSampleTime,
+          elapsedRealtimeNanos: _locationService.lastElapsedRealtimeNanos,
         );
       }
 
@@ -1532,17 +1548,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                   'speed: ${speedDisplay.toStringAsFixed(1)} ${_getSpeedUnit()}',
                 ),
                 Text('display km/h: ${displayKmh.toStringAsFixed(1)}'),
+                Text(
+                  'timing km/h: ${_locationService.timingSpeedKmh.toStringAsFixed(1)}',
+                ),
                 Text('confirmed km/h: ${confirmedKmh.toStringAsFixed(1)}'),
                 Text('raw native km/h: ${rawNativeKmh.toStringAsFixed(1)}'),
+                Text('provider: ${_locationService.provider}'),
                 Text('interval: ${_locationService.lastGpsIntervalMs}ms'),
                 Text('sample age: ${_locationService.lastGpsSampleAgeMs}ms'),
                 Text(
                   'accuracy: ${_locationService.lastGpsAccuracy.toStringAsFixed(0)}m',
                 ),
                 Text(
+                  'sats: ${_locationService.usedSatelliteCount}/${_locationService.satelliteCount}',
+                ),
+                Text(
                   'move: ${_locationService.lastGpsMoveDistance.toStringAsFixed(1)}m',
                 ),
                 Text('updates: ${_locationService.gpsUpdateCount}'),
+                Text(
+                  'armed: ${_performanceService.isArmed}  t: ${_performanceService.getCurrentElapsedTime().toStringAsFixed(3)}s',
+                ),
                 Text('ready: ${_locationService.isReadyForTest}'),
               ],
             ),
@@ -2419,7 +2445,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     Color sourceColor;
     String label;
 
-    if (source == 'GPS' || source == 'Native GPS') {
+    if (source == 'GPS' ||
+        source == 'Native GPS' ||
+        source == 'GNSS' ||
+        source == 'NMEA') {
       sourceColor = Colors.greenAccent;
       label = accuracy < 999
           ? 'Source: $source  •  Accuracy: ${accuracy.toStringAsFixed(0)}m'
