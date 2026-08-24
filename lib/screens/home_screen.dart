@@ -316,7 +316,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     with WidgetsBindingObserver {
   int _selectedIndex = 0;
   String _activeTab = "SPEED";
-  String _selectedSpeedPreset = "0-60 mph";
+  String _selectedSpeedPreset = "0-100km/h";
   String _selectedDistancePreset = "1/8 mile";
   double _currentSpeed = 0.0;
   double _currentDistance = 0.0;
@@ -963,7 +963,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     }
   }
 
-  Future<void> _confirmManualStartRun() async {
+  void _armRunFromStartButton() {
     if (!_isHomeScreenVisible ||
         !_isTimerTabActive ||
         _isBlockingDialogOpen ||
@@ -972,52 +972,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       return;
     }
 
-    _isBlockingDialogOpen = true;
-    // _locationService.setMotionDebugEnabled(false);
-
-    final shouldStart = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF1C1C1C),
-          title: const Text(
-            'Start Test?',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-          content: const Text(
-            'Do you want to start this test and save its result in history?',
-            style: TextStyle(color: Colors.white70),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('No'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text(
-                'Yes, Start',
-                style: TextStyle(
-                  color: Colors.red,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-
-    _isBlockingDialogOpen = false;
-    // _syncMotionDebugState();
-
-    if (!mounted || !_isHomeScreenVisible || !_isTimerTabActive) return;
-
-    if (shouldStart == true) {
-      _saveThisRun = true;
-      _startTimer();
-    }
+    _saveThisRun = true;
+    _startTimer();
   }
 
   void _updateTimerStatus() {
@@ -1354,12 +1310,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
   double _getTargetSpeedFromPreset(String preset) {
     switch (preset) {
+      case "0-60mph":
       case "0-60 mph":
         return 96.5604; // 60 mph in km/h
+      case "0-60km/h":
       case "0-60 km/h":
         return 60.0;
+      case "0-100km/h":
       case "0-100 km/h":
         return 100.0;
+      case "0-100mph":
       case "0-100 mph":
         return 160.934; // 100 mph in km/h
       case "Debug 2 km/h":
@@ -1373,12 +1333,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
   double _getTargetSpeedDisplayValue() {
     switch (_selectedSpeedPreset) {
+      case "0-60mph":
       case "0-60 mph":
         return 60.0;
+      case "0-60km/h":
       case "0-60 km/h":
         return 60.0;
+      case "0-100km/h":
       case "0-100 km/h":
         return 100.0;
+      case "0-100mph":
       case "0-100 mph":
         return 100.0;
       case "Debug 2 km/h":
@@ -1735,10 +1699,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
   Widget _buildSpeedPresets(Map<String, String> t) {
     final List<Map<String, String>> modes = [
-      {'id': '0-60 mph', 'label': t['preset_0_60_mph'] ?? '0-60 mph'},
-      {'id': '0-60 km/h', 'label': t['preset_0_60_kmh'] ?? '0-60 km/h'},
-      {'id': '0-100 km/h', 'label': t['preset_0_100_kmh'] ?? '0-100 km/h'},
-      {'id': '0-100 mph', 'label': t['preset_0_100_mph'] ?? '0-100 mph'},
+      {'id': '0-100km/h', 'label': t['preset_0_100_kmh'] ?? '0-100km/h'},
+      {'id': '0-60mph', 'label': t['preset_0_60_mph'] ?? '0-60mph'},
+      {'id': '0-100mph', 'label': t['preset_0_100_mph'] ?? '0-100mph'},
+      {'id': '0-60km/h', 'label': t['preset_0_60_kmh'] ?? '0-60km/h'},
       // Debug-only test presets. These appear only in debug mode, not release APK.
       if (!const bool.fromEnvironment('dart.vm.product'))
         {'id': 'Debug 2 km/h', 'label': 'Debug 2 km/h'},
@@ -2168,7 +2132,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       if (_canStartBrakingRun) {
         label = "START BRAKING";
         color = Colors.deepOrange;
-        action = _confirmManualStartRun;
+        action = _armRunFromStartButton;
       } else {
         label = "MOVE CAR FOR BRAKING TEST";
         color = Colors.grey;
@@ -2181,7 +2145,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     } else {
       label = t['btn_start'] ?? "START";
       color = Colors.deepOrange;
-      action = _confirmManualStartRun;
+      action = _armRunFromStartButton;
     }
 
     return Padding(
