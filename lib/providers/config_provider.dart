@@ -152,10 +152,10 @@ class ConfigNotifier extends Notifier<AppConfig> {
     "year_invalid": "Please enter a valid year (1900-{currentYear})",
     "profile_created_success": "Profile created successfully!",
     // Speed preset keys
-    "preset_0_60_mph": "0-60 mph",
-    "preset_0_60_kmh": "0-60 km/h",
-    "preset_0_100_kmh": "0-100 km/h",
-    "preset_0_100_mph": "0-100 mph",
+    "preset_0_60_mph": "0-60mph",
+    "preset_0_60_kmh": "0-60km/h",
+    "preset_0_100_kmh": "0-100km/h",
+    "preset_0_100_mph": "0-100mph",
   };
 
   @override
