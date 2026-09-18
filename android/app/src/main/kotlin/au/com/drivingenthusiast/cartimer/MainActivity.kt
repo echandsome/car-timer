@@ -1,4 +1,4 @@
-package com.example.car_timer
+package au.com.drivingenthusiast.cartimer
 
 import android.Manifest
 import android.content.pm.PackageManager
